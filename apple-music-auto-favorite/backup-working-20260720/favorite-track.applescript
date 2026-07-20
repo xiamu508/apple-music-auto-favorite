@@ -113,109 +113,6 @@ on findRowGroup(el, depth, titles, found)
 	end tell
 end findRowGroup
 
--- ============ 快速歌曲行定位 (优先, 只走容器骨架) ============
---
--- 性能背景: findRowGroup 从 window 1 逐元素递归(读每个节点的 role), 会先遍历
---   侧栏 outline + 主页/新发现货架的数百个卡片才到专辑页, 实测 ~6 秒。
---
--- 快速策略:
---   1) 只下钻"容器骨架": list / scroll area / splitter group; 歌曲行是这些容器的
---      直接子 group(叶子), 不再逐元素读 role。
---   2) 每个容器只用一次 Apple Event 批量读 `description of groups`, 命中歌名再确认。
---   3) 跳过含 outline 的侧栏 scroll area(整棵侧栏不进)。
---   真实层级: window 1 > splitter group 1 > scroll area(专辑) > list"集合" > list"节" > group(行)
-on scanForRow(node, titles, found, depth)
-	tell application "System Events"
-		if (item 1 of found) is not missing value then return
-		if depth > 14 then return
-
-		-- 命中检测: 一次批量读直接子 group 的 description
-		-- 注意1: 参数不能叫 container, 那是 System Events 的保留词, 会被当成关键字而报错。
-		-- 注意2: 必须用 specifier 形式 `description of groups of node` 才能批量读;
-		--   `description of <列表变量>` 会报错 -1728。
-		set gs to {}
-		try
-			set gs to groups of node
-		end try
-		if (count of gs) > 0 then
-			set descs to {}
-			try
-				set descs to description of groups of node
-			end try
-			repeat with i from 1 to (count of descs)
-				set d to ""
-				try
-					set d to (item i of descs) as text
-				end try
-				if d is not "" and my titleMatches(d, titles) then
-					-- 确认是歌曲行(含 description 为"更多"的按钮), 排除货架卡片等。
-					-- 必须先把 description 存入变量 bl 再用下标 item q of bl 取;
-					-- 直接 `repeat with bd in (description of buttons of cand)` 遍历临时列表会误判。
-					set cand to item i of gs
-					set candHasMore to false
-					set bl to {}
-					try
-						set bl to description of buttons of cand
-					end try
-					repeat with q from 1 to (count of bl)
-						set bdt to ""
-						try
-							set bdt to (item q of bl) as text
-						end try
-						if bdt is "更多" or bdt is "More" then
-							set candHasMore to true
-							exit repeat
-						end if
-					end repeat
-					if candHasMore then
-						set item 1 of found to (contents of cand)
-						return
-					end if
-				end if
-			end repeat
-		end if
-
-		-- 下钻 list
-		set ls to {}
-		try
-			set ls to lists of node
-		end try
-		repeat with i from 1 to (count of ls)
-			my scanForRow(item i of ls, titles, found, depth + 1)
-			if (item 1 of found) is not missing value then return
-		end repeat
-
-		-- 下钻 scroll area(跳过含 outline 的侧栏, 整棵侧栏不进)。
-		-- 逆序遍历: 刚 open location 打开的专辑页通常是最后加入的 content scroll area,
-		-- 逆序能先命中它、直接返回, 跳过主页/新发现货架的耗时遍历。
-		set sas to {}
-		try
-			set sas to scroll areas of node
-		end try
-		repeat with i from (count of sas) to 1 by -1
-			set sa to item i of sas
-			set isSidebar to false
-			try
-				if (count of outlines of sa) > 0 then set isSidebar to true
-			end try
-			if not isSidebar then
-				my scanForRow(sa, titles, found, depth + 1)
-				if (item 1 of found) is not missing value then return
-			end if
-		end repeat
-
-		-- 下钻 splitter group
-		set sgs to {}
-		try
-			set sgs to splitter groups of node
-		end try
-		repeat with i from 1 to (count of sgs)
-			my scanForRow(item i of sgs, titles, found, depth + 1)
-			if (item 1 of found) is not missing value then return
-		end repeat
-	end tell
-end scanForRow
-
 -- ============ 在歌曲行上执行收藏 ============
 
 -- 递归查找一个可见的 AXMenu (兜底: 万一菜单不是按钮/行 group 的直接子元素)
@@ -266,12 +163,20 @@ end locateMenu
 -- 在已定位的行 group g 上收藏。返回 favorited / already_favorite / menu_not_found
 on favoriteInRow(g)
 	tell application "System Events"
-		-- 注意: 绝不能用行内"喜爱"按钮判断是否已收藏!
-		-- 被选中/悬停的行会出现一个 description 为"喜爱"的内联切换按钮(常为 enabled=false),
-		-- 无论该曲是否已收藏它都存在(尤其单曲页/被打开的目标曲), 据此判断会造成"虚假已收藏"。
-		-- 唯一可靠依据是"更多"菜单: 含"撤销喜爱/取消喜爱"=已收藏; 含"喜爱"=未收藏, 需点击。
+		-- 1) 行内持久指示: 已喜爱的行含一个 description 为"喜爱"的(不可点)按钮
+		try
+			repeat with b in (buttons of g)
+				set bd to ""
+				try
+					set bd to description of b as text
+				end try
+				if bd is "喜爱" or bd is "已喜爱" or bd is "Favorited" or bd is "Favourited" then
+					return "already_favorite"
+				end if
+			end repeat
+		end try
 
-		-- 1) 找"更多"按钮
+		-- 2) 找"更多"按钮
 		set moreBtn to missing value
 		try
 			repeat with b in (buttons of g)
@@ -287,7 +192,7 @@ on favoriteInRow(g)
 		end try
 		if moreBtn is missing value then return "menu_not_found"
 
-		-- 2) 打开"更多"菜单: 优先 AXPress, 兜底 AXShowMenu; 轮询定位菜单
+		-- 3) 打开"更多"菜单: 优先 AXPress, 兜底 AXShowMenu; 轮询定位菜单
 		set theMenu to missing value
 		repeat with openAttempt from 1 to 4
 			if openAttempt ≤ 2 then
@@ -308,7 +213,7 @@ on favoriteInRow(g)
 		end repeat
 		if theMenu is missing value then return "menu_not_found"
 
-		-- 3) 读取菜单项
+		-- 4) 读取菜单项
 		set itemNames to {}
 		try
 			set itemNames to name of menu items of theMenu
@@ -383,16 +288,9 @@ on run argv
 		tell application "System Events"
 			tell process "Music"
 				if (count of windows) > 0 then
-					-- 优先: 快速容器骨架扫描(批量读 description, 跳过侧栏)
 					try
-						my scanForRow(window 1, titles, found, 0)
+						my findRowGroup(window 1, 0, titles, found)
 					end try
-					-- 兜底: 万一布局异常, 退回全量逐元素递归
-					if (item 1 of found) is missing value then
-						try
-							my findRowGroup(window 1, 0, titles, found)
-						end try
-					end if
 				end if
 			end tell
 		end tell
